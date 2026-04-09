@@ -4,11 +4,14 @@ Uses an in-memory SQLite database for fast, isolated tests. Each test gets a
 fresh schema created from ``Base.metadata``.
 """
 
+import os
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+
+os.environ["DB_BOOTSTRAP"] = "0"
 
 from app.core.database import Base, get_db
 from app.main import app
@@ -45,12 +48,7 @@ def client(db_session):
             pass
 
     app.dependency_overrides[get_db] = override_get_db
+    # Now safe to use as context manager: DB bootstrap is disabled for tests.
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
-
-
-def test_health(client):
-    r = client.get("/health")
-    assert r.status_code == 200
-    assert r.json() == {"status": "ok"}

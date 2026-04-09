@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
+    DB_BOOTSTRAP: bool = True
 
     @property
     def database_url(self) -> str:
