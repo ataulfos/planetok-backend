@@ -165,7 +165,6 @@ def query_with_template(
 
 
 def analyze_task(title: str, description: str) -> dict:
-<<<<<<< HEAD
     """
     Analiza una tarea y retorna categoría y subtasks (heredado para compatibilidad).
     
@@ -201,7 +200,6 @@ def register_custom_template(name: str, prompt_template: str) -> None:
         prompt_template: Template del prompt (puede tener {placeholders})
     """
     PROMPT_TEMPLATES[name] = prompt_template
-=======
     from app.core.config import settings
 
     if not settings.OPENAI_API_KEY:
@@ -276,4 +274,3 @@ def register_custom_template(name: str, prompt_template: str) -> None:
         raise AIAgentError("not enough subtasks")
 
     return {"category": category, "subtasks": steps}
->>>>>>> cbff08abc599c8e975761beed905bd0b00f6529c
