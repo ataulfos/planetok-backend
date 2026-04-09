@@ -87,6 +87,31 @@ def _get_task_or_404(db: Session, task_id: UUID, owner_id: UUID) -> Task:
     return task
 
 
+def _apply_ai_result(db: Session, task: Task, result: dict) -> None:
+    category = result.get("category")
+    subtasks = result.get("subtasks") or []
+    if category not in ("personal", "work", "urgent"):
+        raise AIAgentError("invalid category")
+    if not isinstance(subtasks, list) or not all(isinstance(x, str) for x in subtasks):
+        raise AIAgentError("invalid subtasks")
+
+    task.category = category
+
+    # Replace existing subtasks.
+    for existing in list(task.subtasks or []):
+        db.delete(existing)
+    db.flush()
+
+    titles = [t.strip() for t in subtasks if t and t.strip()]
+    titles = titles[:6] if len(titles) > 6 else titles
+    if len(titles) < 2:
+        titles = titles + ["Review and refine details", "Schedule time to execute"]
+        titles = titles[:2]
+
+    for idx, title in enumerate(titles):
+        db.add(Subtask(task_id=task.id, title=title, order=idx, completed=False))
+
+
 @router.get("/", response_model=list[TaskResponse])
 def list_tasks(
     status_filter: Optional[TaskStatus] = Query(default=None, alias="status"),
@@ -116,6 +141,7 @@ def list_tasks(
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=TaskResponse)
 def create_task(
     payload: TaskCreateRequest,
+    analyze: bool = Query(default=False, description="If true, run AI analyze after create"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> TaskResponse:
@@ -129,6 +155,20 @@ def create_task(
     db.add(task)
     db.commit()
     db.refresh(task)
+
+    if analyze:
+        try:
+            result = analyze_task(task.title, task.description or "")
+            _apply_ai_result(db, task, result)
+            db.commit()
+            db.refresh(task)
+        except AIAgentError as e:
+            db.rollback()
+            msg = str(e).lower()
+            if "timeout" in msg:
+                raise HTTPException(status_code=504, detail="ai agent timeout")
+            raise HTTPException(status_code=502, detail="ai agent unavailable")
+
     return TaskResponse.from_orm_obj(task)
 
 
@@ -192,30 +232,10 @@ def analyze_task_endpoint(
         if "timeout" in msg:
             raise HTTPException(status_code=504, detail="ai agent timeout")
         raise HTTPException(status_code=502, detail="ai agent unavailable")
-
-    category = result.get("category")
-    subtasks = result.get("subtasks") or []
-    if category not in ("personal", "work", "urgent"):
+    try:
+        _apply_ai_result(db, task, result)
+    except AIAgentError:
         raise HTTPException(status_code=502, detail="ai agent unavailable")
-    if not isinstance(subtasks, list) or not all(isinstance(x, str) for x in subtasks):
-        raise HTTPException(status_code=502, detail="ai agent unavailable")
-
-    task.category = category
-
-    # Replace existing subtasks.
-    for existing in list(task.subtasks or []):
-        db.delete(existing)
-    db.flush()
-
-    titles = [t.strip() for t in subtasks if t and t.strip()]
-    titles = titles[:6] if len(titles) > 6 else titles
-    if len(titles) < 2:
-        # Guarantee at least 2 actionable steps.
-        titles = titles + ["Review and refine details", "Schedule time to execute"]
-        titles = titles[:2]
-
-    for idx, title in enumerate(titles):
-        db.add(Subtask(task_id=task.id, title=title, order=idx, completed=False))
 
     db.commit()
     db.refresh(task)

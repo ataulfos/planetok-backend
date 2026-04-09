@@ -18,14 +18,18 @@ Ejemplo de uso:
     result = analyze_task(title="...", description="...")
 """
 
-from typing import Optional, Dict, Any
-from enum import Enum
+from __future__ import annotations
+
 import json
 import os
+from enum import Enum
+from typing import Any, Dict, Optional
+
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
 from pydantic import BaseModel
+
+from app.core.config import settings
 
 load_dotenv()
 
@@ -48,14 +52,27 @@ class TaskAnalysis(BaseModel):
 
 
 # Templates predefinidos
-PROMPT_TEMPLATES = {
-    "analyze_task": """Analiza la siguiente tarea y proporciona categoría y subtasks.
+PROMPT_TEMPLATES: dict[str, str] = {
+    "classify_task": """Clasifica la siguiente tarea en una de estas categorías: personal, work, urgent.
 
 Tarea: {title}
 Descripción: {description}
 
 Responde en JSON con este formato:
-{{"category": "personal|work|urgent", "subtasks": ["paso 1", "paso 2", ...]}}""",
+{{"category": "personal|work|urgent"}}""",
+
+    "suggest_subtasks": """Sugiere subtareas accionables para completar esta tarea.
+
+Tarea: {title}
+Descripción: {description}
+Categoría: {category}
+
+Responde en JSON con este formato:
+{{"subtasks": ["paso 1", "paso 2", "..."]}}
+
+Reglas:
+- Devuelve entre 2 y 6 subtareas.
+- No incluyas texto fuera del JSON.""",
     
     "generate_steps": """Genera los pasos detallados para completar esta tarea:
 
@@ -73,12 +90,12 @@ Responde en JSON: {{"complexity": "low|medium|high", "reason": "..."}}""",
 
 def _get_llm():
     """Obtiene la instancia de ChatOpenAI configurada."""
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise AIAgentError("OPENAI_API_KEY no está configurada")
     
     return ChatOpenAI(
-        model="gpt-4o-mini",
+        model=settings.OPENAI_MODEL or "gpt-4o-mini",
         temperature=0.7,
         api_key=api_key
     )
@@ -166,7 +183,9 @@ def query_with_template(
 
 def analyze_task(title: str, description: str) -> dict:
     """
-    Analiza una tarea y retorna categoría y subtasks (heredado para compatibilidad).
+    Analiza una tarea en 2 pasos (secuencial):
+    1) Clasificación (category)
+    2) Sugerencia de subtareas (subtasks)
     
     Args:
         title: Título de la tarea
@@ -178,17 +197,29 @@ def analyze_task(title: str, description: str) -> dict:
     Raises:
         AIAgentError: Si falla el análisis
     """
-    result = query_with_template(
-        template="analyze_task",
+    step1 = query_with_template(
+        template="classify_task",
         context={"title": title, "description": description},
-        json_mode=True
+        json_mode=True,
     )
-    
-    # Validar estructura
-    if "category" not in result or "subtasks" not in result:
-        raise AIAgentError(f"Respuesta inválida del agente: {result}")
-    
-    return result
+    category = step1.get("category")
+    if category not in ("personal", "work", "urgent"):
+        raise AIAgentError(f"Respuesta inválida del agente (category): {step1}")
+
+    step2 = query_with_template(
+        template="suggest_subtasks",
+        context={"title": title, "description": description, "category": category},
+        json_mode=True,
+    )
+    subtasks = step2.get("subtasks")
+    if (
+        not isinstance(subtasks, list)
+        or not all(isinstance(x, str) and x.strip() for x in subtasks)
+        or not (2 <= len(subtasks) <= 6)
+    ):
+        raise AIAgentError(f"Respuesta inválida del agente (subtasks): {step2}")
+
+    return {"category": category, "subtasks": [s.strip() for s in subtasks]}
 
 
 def register_custom_template(name: str, prompt_template: str) -> None:
@@ -200,77 +231,3 @@ def register_custom_template(name: str, prompt_template: str) -> None:
         prompt_template: Template del prompt (puede tener {placeholders})
     """
     PROMPT_TEMPLATES[name] = prompt_template
-    from app.core.config import settings
-
-    if not settings.OPENAI_API_KEY:
-        raise AIAgentError("missing OPENAI_API_KEY")
-
-    try:
-        from langchain_openai import ChatOpenAI
-    except Exception as e:  # pragma: no cover
-        raise AIAgentError(f"langchain-openai unavailable: {e}")
-
-    llm = ChatOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        model=settings.OPENAI_MODEL,
-        temperature=0.2,
-        timeout=20,
-    )
-
-    system = (
-        "You are a task analysis assistant.\n"
-        "Given a task title and description, you must return ONLY valid JSON.\n"
-        'Schema: {"category":"personal|work|urgent","subtasks":["...", "..."]}\n'
-        "- category must be exactly one of: personal, work, urgent.\n"
-        "- subtasks must be 2 to 6 short, actionable steps.\n"
-        "- Do not include any extra keys.\n"
-        "- Do not wrap JSON in markdown.\n"
-    )
-    user = f"Title: {title}\nDescription: {description or ''}"
-
-    try:
-        msg = llm.invoke(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ]
-        )
-    except Exception as e:
-        raise AIAgentError(str(e))
-
-    content = getattr(msg, "content", None)
-    if not isinstance(content, str) or not content.strip():
-        raise AIAgentError("empty model response")
-
-    import json
-
-    try:
-        data = json.loads(content)
-    except Exception:
-        # Some models may include stray text; try to salvage first JSON object.
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise AIAgentError("invalid json")
-        try:
-            data = json.loads(content[start : end + 1])
-        except Exception:
-            raise AIAgentError("invalid json")
-
-    if not isinstance(data, dict):
-        raise AIAgentError("invalid output type")
-
-    category = data.get("category")
-    subtasks = data.get("subtasks")
-    if category not in ("personal", "work", "urgent"):
-        raise AIAgentError("invalid category")
-    if not isinstance(subtasks, list) or not all(isinstance(x, str) for x in subtasks):
-        raise AIAgentError("invalid subtasks")
-
-    # Normalize.
-    steps = [s.strip() for s in subtasks if s and s.strip()]
-    steps = steps[:6]
-    if len(steps) < 2:
-        raise AIAgentError("not enough subtasks")
-
-    return {"category": category, "subtasks": steps}
